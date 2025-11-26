@@ -170,12 +170,13 @@ class MoELayer(BaseMoELayer):
         hidden states and probabilities for the token dispatcher. The original
         hidden states are returned as a residual connection.
         """
-        residual = hidden_states
-        probs, routing_map = self.router(hidden_states)
-        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs
-        )
-        return hidden_states, probs, residual
+        with torch.profiler.record_function(f"XXXXXXXX: phase=fwd&moe_layer={self.layer_number}&fun=moe_layer%3Arouter_and_preprocess"):
+            residual = hidden_states
+            probs, routing_map = self.router(hidden_states)
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs
+            )
+            return hidden_states, probs, residual
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
@@ -183,7 +184,8 @@ class MoELayer(BaseMoELayer):
         tokens and their associated probabilities to the devices hosting their assigned
         experts.
         """
-        return self.token_dispatcher.token_dispatch(hidden_states, probs)
+        with torch.profiler.record_function(f"XXXXXXXX: phase=fwd&moe_layer={self.layer_number}&fun=moe_layer%3Adispatch"):
+            return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     def experts_compute(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, residual: torch.Tensor
@@ -196,18 +198,19 @@ class MoELayer(BaseMoELayer):
         it is also applied. The output from the experts is preprocessed for the
         combine step.
         """
-        shared_expert_output = None
-        if self.use_shared_expert and not self.shared_expert_overlap:
-            # Compute the shared expert separately when not overlapped with communication.
-            shared_expert_output = self.shared_experts(residual)
-        dispatched_input, tokens_per_expert, permuted_probs = (
-            self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
-        )
-        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
-        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        output = self.token_dispatcher.combine_preprocess(expert_output)
+        with torch.profiler.record_function(f"XXXXXXXX: phase=fwd&moe_layer={self.layer_number}&fun=moe_layer%3Aexperts_compute"):
+            shared_expert_output = None
+            if self.use_shared_expert and not self.shared_expert_overlap:
+                # Compute the shared expert separately when not overlapped with communication.
+                shared_expert_output = self.shared_experts(residual)
+            dispatched_input, tokens_per_expert, permuted_probs = (
+                self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
+            )
+            expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
+            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+            output = self.token_dispatcher.combine_preprocess(expert_output)
 
-        return output, shared_expert_output, mlp_bias
+            return output, shared_expert_output, mlp_bias
 
     def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Combines expert outputs via communication and adds shared expert output.
@@ -216,11 +219,15 @@ class MoELayer(BaseMoELayer):
         experts (e.g., via an All-to-All communication). It then adds the output
         from the shared expert if it exists.
         """
-        output = self.token_dispatcher.token_combine(output)
-        output = self.token_dispatcher.combine_postprocess(output)
-        if shared_expert_output is not None:
-            output = output + shared_expert_output
-        return output
+
+        with torch.profiler.record_function(f"XXXXXXXX: phase=fwd&moe_layer={self.layer_number}&fun=moe_layer%3Acombine"):
+
+            output = self.token_dispatcher.token_combine(output)
+            output = self.token_dispatcher.combine_postprocess(output)
+            if shared_expert_output is not None:
+                output = output + shared_expert_output
+
+            return output
 
     def forward(self, hidden_states: torch.Tensor):
         """Forward pass for the MoE layer.
@@ -237,6 +244,9 @@ class MoELayer(BaseMoELayer):
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
+
+        hidden_states = NvtxrOP.apply(hidden_states, f"moe_layer_{self.layer_number}", True)
+
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
@@ -267,6 +277,8 @@ class MoELayer(BaseMoELayer):
         else:
             output, mlp_bias = custom_forward(hidden_states)
 
+        hidden_states = NvtxrOP.apply(output, f"moe_layer_{self.layer_number}", False)
+
         return output, mlp_bias
 
     def backward_dw(self):
@@ -274,3 +286,41 @@ class MoELayer(BaseMoELayer):
         self.experts.backward_dw()
         if self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()
+
+
+ctx_dict = {}
+
+class NvtxrOP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, timer_name, is_front):
+        global ctx_dict
+        nvtxName = timer_name + '_fwd'
+        print(f"NvtxrOP: {nvtxName=} {if_front=}")
+
+        if is_front:
+            ctx_dict[nvtxName] = torch.profiler.record_function(nvtxName)
+            ctx_dict[nvtxName].__enter__()
+            # torch.cuda.nvtx.range_push(nvtxName)
+        else:
+            ctx_dict[nvtxName].__exit__(None, None, None)
+            # torch.cuda.nvtx.range_pop(nvtxName)
+
+        ctx.timer_name = timer_name
+        ctx.is_front = is_front
+
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_in):
+        global ctx_dict
+        nvtxName = ctx.timer_name + '_bwd'
+        is_frount= ctx.is_front
+        print(f"NvtxrOP: {nvtxName=} {if_front=}")
+
+        if ctx.is_front:
+            ctx_dict[nvtxName] = torch.profiler.record_function(nvtxName)
+            ctx_dict[nvtxName].__enter__()
+        else:
+            ctx_dict[nvtxName].__exit__(None, None, None)
+
+        return grad_in, None, None

@@ -471,21 +471,26 @@ def group_limited_topk(
     """
     # Organize the experts into groups
     # Select groups based on sum of top-(topk/group_topk) routing scores within each group
-    group_scores = (
-        scores.view(num_tokens, num_groups, -1).topk(topk // group_topk, dim=-1)[0].sum(dim=-1)
-    )
-    group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False)[1]
-    group_mask = torch.zeros_like(group_scores)
+    with torch.profiler.record_function(f"XXXXXXXX: phase=group_scores&fun=moe_utils.py%3Agroup_limited_topk"):
+        group_scores = (
+            scores.view(num_tokens, num_groups, -1).topk(topk // group_topk, dim=-1)[0].sum(dim=-1)
+        )
+    with torch.profiler.record_function(f"XXXXXXXX: phase=torch.topk&fun=moe_utils.py%3Agroup_limited_topk"):
+        group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False)[1]
+    with torch.profiler.record_function(f"XXXXXXXX: phase=torch.zeros_like&fun=moe_utils.py%3Agroup_limited_topk"):
+        group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1)
 
     # Mask the experts based on selection groups
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(num_tokens, num_groups, num_experts // num_groups)
-        .reshape(num_tokens, -1)
-    )
+    with torch.profiler.record_function(f"XXXXXXXX: phase=score_mask&fun=moe_utils.py%3Agroup_limited_topk"):
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(num_tokens, num_groups, num_experts // num_groups)
+            .reshape(num_tokens, -1)
+        )
 
-    masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
+    with torch.profiler.record_function(f"XXXXXXXX: phase=masked_scores&fun=moe_utils.py%3Agroup_limited_topk"):
+        masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
     probs, top_indices = torch.topk(masked_scores, k=topk, dim=-1)
 
     return probs, top_indices
@@ -590,7 +595,8 @@ def topk_softmax_with_capacity(
             probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+            with torch.profiler.record_function(f"XXXXXXXX: phase=torch.softmax&fun=moe_utils.py%3Atopk_softmax_with_capacity"):
+                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
     elif score_function == "sigmoid":
         scores = torch.sigmoid(logits.float()).type_as(logits)
         if expert_bias is not None:
@@ -599,7 +605,8 @@ def topk_softmax_with_capacity(
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        with torch.profiler.record_function(f"XXXXXXXX: phase=sigmoid&fun=moe_utils.py%3Atopk_softmax_with_capacity"):
+            probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
@@ -860,7 +867,8 @@ def apply_random_logits(logits):
     """
     Apply the RandomSTE function to the logits.
     """
-    return RandomSTE.apply(logits)
+    with torch.profiler.record_function(f"XXXXXXXX: phase=RandomSTE.apply&fun=moe_utils.py%3Aapply_random_logits"):
+        return RandomSTE.apply(logits)
 
 
 class RouterGatingLinearFunction(torch.autograd.Function):
@@ -881,10 +889,12 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN")
-            output = output[0]
+            with torch.profiler.record_function(f"XXXXXXXX: phase=te_general_gemm&fun=RouterGatingLinearFunction%3Aforward"):
+                output = te_general_gemm(weight, inp, router_dtype, layout="TN")
+                output = output[0]
         else:
-            output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+            with torch.profiler.record_function(f"XXXXXXXX: phase=torch.mm&fun=RouterGatingLinearFunction%3Aforward"):
+                output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
 
         output = output.view(*inp_shape[:-1], -1)
         return output
@@ -901,17 +911,21 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         grad_output = grad_output.view(-1, grad_shape[-1])
 
         if te_general_gemm is not None and ctx.router_dtype != torch.float64:
-            grad_input = te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
-            )
-            grad_weight = te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
-            )
+            with torch.profiler.record_function(f"XXXXXXXX: obj=grad_input&phase=te_general_gemm&fun=RouterGatingLinearFunction%3Abackward"):
+                grad_input = te_general_gemm(
+                    weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+                )
+            with torch.profiler.record_function(f"XXXXXXXX: obj=grad_weight&phase=te_general_gemm&fun=RouterGatingLinearFunction%3Abackward"):
+                grad_weight = te_general_gemm(
+                    inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+                )
             grad_input = grad_input[0].to(ctx.input_dtype)
             grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
-            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+            with torch.profiler.record_function(f"XXXXXXXX: obj=grad_input&phase=torch.mm&fun=RouterGatingLinearFunction%3Abackward"):
+                grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
+            with torch.profiler.record_function(f"XXXXXXXX: obj=grad_weight&phase=torch.mm&fun=RouterGatingLinearFunction%3Abackward"):
+                grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
 
         grad_input = grad_input.view(*inp_shape)
         return grad_input, grad_weight, None
