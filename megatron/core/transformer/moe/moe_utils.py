@@ -4,6 +4,7 @@ import math
 from typing import List, Optional, Union
 
 import torch
+import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ModelCommProcessGroups
@@ -582,7 +583,45 @@ def topk_softmax_with_capacity(
                 group_topk=group_topk,
             )
         else:
-            return torch.topk(scores, k=topk, dim=1)
+            # print("Local node ep comm limit")
+            # torch.set_printoptions(profile="full")
+            num_moe_experts = num_experts
+            ep_rank = parallel_state.get_expert_model_parallel_rank()
+            etp_rank = parallel_state.get_expert_tensor_parallel_rank()
+            ep_world_size = parallel_state.get_expert_model_parallel_world_size()
+            etp_world_size = parallel_state.get_expert_tensor_parallel_world_size()
+            
+            local_rank_num_experts = num_moe_experts // ep_world_size
+            
+            assert etp_world_size * ep_world_size >= 8
+            num_eps_per_node = 8 // etp_world_size
+            experts_per_node = local_rank_num_experts * num_eps_per_node 
+             
+            assert experts_per_node >= topk
+            local_node_expert_start = ep_rank // 8 * experts_per_node
+            local_node_expert_end = local_node_expert_start + experts_per_node
+
+            # a, b = torch.topk(scores, k=topk, dim=1)
+
+            # 只取本地专家列
+            local_scores = scores[:, local_node_expert_start:local_node_expert_end]
+            # 在局部做 topk
+            topk_scores, topk_indices = torch.topk(local_scores, k=topk, dim=1)
+            # indices 要映射回全局 expert id
+            topk_indices = topk_indices + local_node_expert_start
+            # if etp_rank == 0:
+            #     if ep_rank == 10:
+            #         print("+++++++++++++++++++++++")
+            #         print(b[0:10])
+            #         print("****************")
+            #         print(local_node_expert_start)
+            #         print("++++++++++++++++++++++")
+            #         print("________________________________")
+            #         print(topk_indices[0:10])
+            #         print("________________________________")
+            return topk_scores, topk_indices
+
+            # return torch.topk(scores, k=topk, dim=1)
 
     if score_function == "softmax":
         if use_pre_softmax:
@@ -936,6 +975,7 @@ def get_default_model_comm_pgs():
     """
     model_comm_pgs = ModelCommProcessGroups()
     model_comm_pgs.ep = parallel_state.get_expert_model_parallel_group()
+    model_comm_pgs.ep_sg = parallel_state.get_expert_model_parallel_subgroup()
     model_comm_pgs.tp = parallel_state.get_tensor_model_parallel_group()
     model_comm_pgs.cp = parallel_state.get_context_parallel_group()
     model_comm_pgs.expt_tp = parallel_state.get_expert_tensor_parallel_group()

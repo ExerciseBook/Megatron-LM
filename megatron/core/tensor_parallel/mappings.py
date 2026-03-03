@@ -6,7 +6,7 @@ from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
 
 from .utils import split_tensor_along_last_dim
-
+from megatron.core import parallel_state
 try:
     if is_torch_min_version("1.13.0"):
         dist_all_gather_func = torch.distributed.all_gather_into_tensor
@@ -421,7 +421,8 @@ class _AllToAll(torch.autograd.Function):
     @staticmethod
     def forward(ctx, group, input, output_split_sizes, input_split_sizes):
         """Forward function."""
-        ctx.group = group
+        # ctx.group = group
+        ctx.group = parallel_state.get_expert_model_parallel_subgroup()
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
 
@@ -441,6 +442,20 @@ class _AllToAll(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
+        # from megatron.core import parallel_state
+        # ep_rank = parallel_state.get_expert_model_parallel_rank()
+        # etp_rank = parallel_state.get_expert_tensor_parallel_rank()
+        # if etp_rank == 0:
+        #     if ep_rank == 10:
+        #         print("+++++++++++++++++++++++")
+        #         print(input_split_sizes)
+        #         print("****************")
+        #         print(input)
+        #         print("++++++++++++++++++++++")
+        #         print(input.shape)
+        #         print("________________________________")
+        #         print(group)
+        #         print("________________________________")
         torch.distributed.all_to_all_single(
             output,
             input,

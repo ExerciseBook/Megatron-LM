@@ -47,6 +47,7 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
+_EXPERT_MODEL_PARALLEL_SUBGROUP = None
 # Expert tensor parallel group that current rank belongs to.
 _EXPERT_TENSOR_PARALLEL_GROUP = None
 # Expert tensor and model combined parallel group
@@ -826,10 +827,24 @@ def initialize_model_parallel(
         4 pipeline model-parallel groups: [g0, g2], [g0, g3], [g1, g4], [g1, g5]
         """
         if is_expert:
-            d_ranks = expert_decoder_rank_generator.get_ranks(group_type, **kwargs)
+            if group_type == 'ep_sg':
+                d_ranks = expert_decoder_rank_generator.get_ranks('ep', **kwargs)
+            else:
+                d_ranks = expert_decoder_rank_generator.get_ranks(group_type, **kwargs)
         else:
             d_ranks = decoder_rank_generator.get_ranks(group_type, **kwargs)
-
+        
+        if group_type == 'ep_sg':
+            # print("d_ranks")
+            # print(d_ranks)
+            m = 2 # etp
+            n = 8 // m # ep per node
+            merged = []
+            for i in range(len(d_ranks)):
+                merged += d_ranks[i]
+            d_ranks = [merged[i:i+n] for i in range(0, len(merged), n)]
+            # print(f"d_ranks:{d_ranks}")
+        
         if encoder_rank_generator is None:
             for x in d_ranks:
                 yield x
@@ -1201,7 +1216,9 @@ def initialize_model_parallel(
     ### Expert-related parallel groups initialization
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP
+    global _EXPERT_MODEL_PARALLEL_SUBGROUP
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
+
     for ranks in generator_wrapper('ep', is_expert=True):
         group = create_group(
             ranks,
@@ -1210,6 +1227,19 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
+
+
+    for ranks in generator_wrapper('ep_sg', is_expert=True):
+        group = create_group(
+            ranks,
+            pg_options=get_nccl_options("ep", nccl_comm_cfgs),
+            group_desc="_EXPERT_MODEL_PARALLEL_SUBGROUP",
+        )
+        # print(f"ranks:{ranks}")
+        # print(f"rank:{rank}")
+        if rank in ranks:
+            _EXPERT_MODEL_PARALLEL_SUBGROUP = group
+        
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
@@ -2017,6 +2047,23 @@ def get_tensor_and_context_parallel_rank():
         return 0
 
 
+def get_expert_model_parallel_subgroup(check_initialized=True):
+    """Get the expert-model-parallel subgroup the caller rank belongs to."""
+    if check_initialized:
+        assert (
+            _EXPERT_MODEL_PARALLEL_SUBGROUP is not None
+        ), "expert model parallel subgroup is not initialized"
+    return _EXPERT_MODEL_PARALLEL_SUBGROUP
+
+
+def get_expert_model_parallel_subgroup_size():
+    """Return the size of each expert model parallel subgroup."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return get_expert_model_parallel_subgroup().size()
+    else:
+        return 4
+
+
 ### Expert-related parallel states functions
 def get_expert_model_parallel_group(check_initialized=True):
     """Get the expert-model-parallel group the caller rank belongs to."""
@@ -2342,6 +2389,9 @@ def destroy_model_parallel():
     # Destroy parallel state related to expert parallelism.
     global _EXPERT_MODEL_PARALLEL_GROUP
     _EXPERT_MODEL_PARALLEL_GROUP = None
+
+    global _EXPERT_MODEL_PARALLEL_SUBGROUP
+    _EXPERT_MODEL_PARALLEL_SUBGROUP = None
 
     global _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
