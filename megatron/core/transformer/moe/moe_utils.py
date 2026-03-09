@@ -583,6 +583,11 @@ def topk_softmax_with_capacity(
                 group_topk=group_topk,
             )
         else:
+            from megatron.training import get_args
+            args = get_args()
+            if not args.dcu_moe_router_localonly:
+                return torch.topk(scores, k=topk, dim=1)
+            
             # print("Local node ep comm limit")
             # torch.set_printoptions(profile="full")
             num_moe_experts = num_experts
@@ -620,8 +625,6 @@ def topk_softmax_with_capacity(
             #         print(topk_indices[0:10])
             #         print("________________________________")
             return topk_scores, topk_indices
-
-            # return torch.topk(scores, k=topk, dim=1)
 
     if score_function == "softmax":
         if use_pre_softmax:

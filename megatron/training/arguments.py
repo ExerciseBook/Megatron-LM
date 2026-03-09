@@ -2832,6 +2832,8 @@ def _add_mla_args(parser):
                        help="Mscale for YaRN RoPE in multi-latent attention.")
     group.add_argument('--mscale-all-dim', type=float, default=1.0,
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--dcu-moe-router-localonly', action='store_true',
+                       help='[DCU Patch] Use only local experts for MoE routing.')
 
     return parser
 
